@@ -1,0 +1,276 @@
+#loading packages
+pacman::p_load(palmerpenguins, tidyverse, tidymodels, skimr, mice, rpart.plot, ranger)
+
+#loading data
+data('penguins')
+
+#check for any leftover NA values
+skim(penguins)
+
+#replacing sex data
+imputed_data = mice(penguins, method = 'pmm', m = 5, maxit = 50, seed = 500)
+
+#Inspect the imputed data
+summary(imputed_data)
+
+# Create a complete dataset with imputed values
+penguins_complete = complete(imputed_data)
+skim(penguins_complete)
+
+#starting from the top w/imputation using tidymodels
+#defining a basic recipe
+basic_recipe =
+  recipe(species ~ ., data = penguins) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_factor_predictors())
+
+#prepping data --> IE looking at data before imputation
+basic_prep = basic_recipe |> prep()
+
+#going through with steps --> baking up dataset
+basic_bake = basic_prep |> bake(new_data = NULL)
+
+#growing short tree by hand
+table(penguins$island, penguins$species)
+
+#split the data based on the island
+biscoe_counts = c(44, 0, 78)  # Counts for Adelie, Chinstrap, Gentoo on Biscoe
+dream_torgersen_counts = c(56 + 52, 68, 0)  # Combined counts for Dream and Torgersen
+
+#total counts for each node
+n_biscoe = sum(biscoe_counts)
+n_dream_torgersen = sum(dream_torgersen_counts)
+
+#total penguins
+n_total = n_biscoe + n_dream_torgersen
+
+#proportions for each species in each node
+p_adelie_biscoe = biscoe_counts[1] / n_biscoe
+p_chinstrap_biscoe = biscoe_counts[2] / n_biscoe
+p_gentoo_biscoe = biscoe_counts[3] / n_biscoe
+
+p_adelie_dream_torgersen = dream_torgersen_counts[1] / n_dream_torgersen
+p_chinstrap_dream_torgersen = dream_torgersen_counts[2] / n_dream_torgersen
+p_gentoo_dream_torgersen = dream_torgersen_counts[3] / n_dream_torgersen
+
+#gini impurity for each node
+gini_biscoe = 1 - (p_adelie_biscoe^2 + p_chinstrap_biscoe^2 + p_gentoo_biscoe^2)
+gini_dream_torgersen = 1 - (p_adelie_dream_torgersen^2 + p_chinstrap_dream_torgersen^2 + p_gentoo_dream_torgersen^2)
+
+#weighted Gini impurity for the split
+weighted_gini_island = (n_biscoe * gini_biscoe + n_dream_torgersen * gini_dream_torgersen) / n_total
+
+#print results
+gini_biscoe
+gini_dream_torgersen
+weighted_gini_island
+
+#growing tree by hand using sex
+table(penguins$sex, penguins$species)
+
+#split the data based on the sex
+female_counts = c(73, 34, 34)  # Counts for Adelie, Chinstrap, Gentoo for females
+male_counts = c(73, 34, 44)  # Counts for Adelie, Chinstrap, Gentoo for males
+
+# Total counts for each node
+n_female = sum(female_counts)
+n_male = sum(male_counts)
+
+# Total penguins (excluding NA values)
+n_total = n_female + n_male
+
+# Proportions for each species in each node
+p_adelie_female = female_counts[1] / n_female
+p_chinstrap_female = female_counts[2] / n_female
+p_gentoo_female = female_counts[3] / n_female
+
+p_adelie_male = male_counts[1] / n_male
+p_chinstrap_male = male_counts[2] / n_male
+p_gentoo_male = male_counts[3] / n_male
+
+# Gini impurity for each node
+gini_female = 1 - (p_adelie_female^2 + p_chinstrap_female^2 + p_gentoo_female^2)
+gini_male = 1 - (p_adelie_male^2 + p_chinstrap_male^2 + p_gentoo_male^2)
+
+# Weighted Gini impurity for the split
+weighted_gini_sex = (n_female * gini_female + n_male * gini_male) / n_total
+
+# Print results
+gini_female
+gini_male
+weighted_gini_sex
+
+
+#specify a decision tree model with a tuning parameter for cost complexity
+tree_model = decision_tree(cost_complexity = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("rpart")
+
+#create a workflow
+penguins_workflow = workflow() %>%
+  add_recipe(basic_recipe) %>%
+  add_model(tree_model)
+
+#set up cross-validation with 5 folds
+set.seed(123)
+penguins_folds = vfold_cv(penguins, v = 5)
+
+#set up a grid of values for cost complexity
+cost_complexity_grid = grid_regular(cost_complexity(), levels = 10)
+
+#tune the model using cross-validation
+set.seed(123)
+tune_results = tune_grid(
+  penguins_workflow,
+  resamples = penguins_folds,
+  grid = cost_complexity_grid,
+  metrics = metric_set(accuracy)
+)
+
+#collect the best tuning parameters
+best_params = select_best(tune_results, metric = "accuracy")
+
+#finalize the workflow with the best parameters
+final_workflow = penguins_workflow %>%
+  finalize_workflow(best_params)
+
+#split the data into training and testing sets
+set.seed(123)
+penguins_split = initial_split(penguins, prop = 0.8)
+penguins_train = training(penguins_split)
+penguins_test = testing(penguins_split)
+
+#fit the final workflow on the training data
+final_fit = final_workflow %>%
+  fit(data = penguins_train)
+
+#make predictions on the test data
+penguins_predictions = predict(final_fit, new_data = penguins_test) %>%
+  bind_cols(penguins_test)
+
+#evaluate the model's performance
+final_metrics = penguins_predictions %>%
+  metrics(truth = species, estimate = .pred_class)
+
+final_conf_mat = penguins_predictions %>%
+  conf_mat(truth = species, estimate = .pred_class)
+
+#print the metrics and confusion matrix
+print(final_metrics)
+print(final_conf_mat)
+
+#visualize the final decision tree
+final_tree = extract_fit_engine(final_fit)
+rpart.plot(final_tree)
+
+# Specify a random forest model with tuning parameters for mtry, min_n, and trees
+rf_model = rand_forest(
+  mtry = tune(),
+  min_n = tune(),
+  trees = tune()
+) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+# Create a workflow
+rf_workflow = workflow() %>%
+  add_recipe(basic_recipe) %>%
+  add_model(rf_model)
+
+#using 5fold CV from last time
+
+# Set up a grid of values for mtry, min_n, and trees
+rf_grid = grid_regular(
+  mtry(range = c(1, 5)),
+  min_n(range = c(2, 10)),
+  trees(range = c(50, 200)),
+  levels = 5
+)
+
+#tuning model
+set.seed(123)
+rf_results = tune_grid(
+  rf_workflow,  # Use the correct workflow variable
+  resamples = penguins_folds,
+  grid = rf_grid,  # Use the correct grid variable
+  metrics = metric_set(accuracy)
+)
+
+# Collect the best tuning parameters
+best_params = select_best(rf_results, metric = "accuracy")
+
+# Finalize the workflow with the best parameters
+final_workflow = rf_workflow %>%
+  finalize_workflow(best_params)
+
+# Split the data into training and testing sets
+set.seed(123)
+penguins_split = initial_split(penguins, prop = 0.8)
+penguins_train = training(penguins_split)
+penguins_test = testing(penguins_split)
+
+# Fit the final workflow on the training data
+final_fit = final_workflow %>%
+  fit(data = penguins_train)
+
+# Make predictions on the test data
+penguins_predictions = predict(final_fit, new_data = penguins_test) %>%
+  bind_cols(penguins_test)
+
+# Evaluate the model's performance
+final_metrics = penguins_predictions %>%
+  metrics(truth = species, estimate = .pred_class)
+
+final_conf_mat = penguins_predictions %>%
+  conf_mat(truth = species, estimate = .pred_class)
+
+# Print the metrics and confusion matrix
+print(final_metrics)
+print(final_conf_mat)
+
+#one more time RF with 'fancy' approaches to imputation
+#RF fancy recipe
+fancy_recipe =
+  recipe(species ~ ., data = penguins) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_impute_knn(all_factor_predictors())
+
+#RF fancy workflow
+rf_fancy_workflow =  workflow() %>%
+  add_recipe(fancy_recipe) %>%
+  add_model(rf_model)
+
+#tuning model
+set.seed(123)
+rf_fancy_results = tune_grid(
+  rf_fancy_workflow,  # Use the correct workflow variable
+  resamples = penguins_folds,
+  grid = rf_grid,  # Use the correct grid variable
+  metrics = metric_set(accuracy)
+)
+
+#grabbing best tuning parameters
+best_fancy_params = select_best(rf_fancy_results, metric = "accuracy")
+
+#final workflow w/best parameters
+final_fancy_workflow = rf_fancy_workflow %>%
+  finalize_workflow(best_fancy_params)
+
+#fit workflow on training data
+final_fancy_fit = final_fancy_workflow %>%
+  fit(data = penguins_train)
+
+#make predictions on the test data
+penguins_fancy_predictions = predict(final_fancy_fit, new_data = penguins_test) %>%
+  bind_cols(penguins_test)
+
+#evaluate the model's performance
+final_fancy_metrics = penguins_predictions %>%
+  metrics(truth = species, estimate = .pred_class)
+
+final_fancy_conf_mat = penguins_predictions %>%
+  conf_mat(truth = species, estimate = .pred_class)
+
+#print results
+print(final_fancy_metrics)
+print(final_fancy_conf_mat)
